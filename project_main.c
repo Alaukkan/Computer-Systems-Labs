@@ -1,6 +1,8 @@
 /* C Standard library */
 #include <stdio.h>
 
+#include <string.h>
+
 /* XDCtools files */
 #include <xdc/std.h>
 #include <xdc/runtime/System.h>
@@ -67,6 +69,24 @@ Void uartTaskFxn(UArg arg0, UArg arg1) {
 
     // JTKJ: Teht�v� 4. Lis�� UARTin alustus: 9600,8n1
     // JTKJ: Exercise 4. Setup here UART connection as 9600,8n1
+    UART_Handle uart;
+    UART_Params uartParams;
+
+    UART_Params_init(&uartParams);
+    uartParams.writeDataMode = UART_DATA_TEXT;
+    uartParams.readDataMode = UART_DATA_TEXT;
+    uartParams.readEcho = UART_ECHO_OFF;
+    uartParams.readMode=UART_MODE_BLOCKING;
+    uartParams.baudRate = 9600;
+    uartParams.dataLength = UART_LEN_8; // 8
+    uartParams.parityType = UART_PAR_NONE; // n
+    uartParams.stopBits = UART_STOP_ONE; // 1
+
+    uart = UART_open(Board_UART0, &uartParams);
+    if (uart == NULL) {
+        System_abort("Error opening the UART");
+    }
+
 
     while (1) {
 
@@ -74,17 +94,18 @@ Void uartTaskFxn(UArg arg0, UArg arg1) {
         //       Muista tilamuutos
         // JTKJ: Exercise 3. Print out sensor data as string to debug window if the state is correct
         //       Remember to modify state
+        char str[16];
         if (programState == DATA_READY) {
-            char str[16];
-            sprintf(str, "%10.2f", ambientLight);
+            sprintf(str, "%10.2f\n\r", ambientLight);
             System_printf(str);
             System_flush();
             programState = WAITING;
         }
 
-
         // JTKJ: Teht�v� 4. L�het� sama merkkijono UARTilla
         // JTKJ: Exercise 4. Send the same sensor data string with UART
+        UART_write(uart, str, strlen(str));
+
 
         // Just for sanity check for exercise, you can comment this out
         System_printf("uartTask\n");
@@ -163,6 +184,7 @@ Int main(void) {
 
     // JTKJ: Teht�v� 4. Ota UART k�ytt��n ohjelmassa
     // JTKJ: Exercise 4. Initialize UART
+    Board_initUART();
 
     // JTKJ: Teht�v� 1. Ota painonappi ja ledi ohjelman k�ytt��n
     //       Muista rekister�id� keskeytyksen k�sittelij� painonapille
