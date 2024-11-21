@@ -5,7 +5,7 @@
  *      Author: alexl
  */
 
-#include <library.h>
+#include "library.h"
 #include <stdio.h>
 #include <time.h>
 #include <string.h>
@@ -32,19 +32,36 @@
 #include "sensors/mpu9250.h"
 #include "buzzer.h"
 
-/* Task */
+
 #define STACKSIZE 2048
+
+#define BUFFER_SAMPLE_LENGTH 3
+#define REFERENCE_SAMPLE_LENGTH 7
+#define NUMBER_OF_MOVEMENTS 3
+
+#define BLOCK_SIZE 2
+
+#define ACCEL_THRESHOLD 0.3f
+#define GYRO_THRESHOLD 200
+
 Char sensorTaskStack[STACKSIZE];
 Char uartTaskStack[STACKSIZE * 2];
 Char buzzerTaskStack[STACKSIZE];
 
-enum state { WAITING=0, READY };
+enum state { WAITING=0, READY, RECIEVING_WAITING, RECIEVING };
 enum state programState = WAITING;
 enum state dataState = WAITING;
 
-struct mpu_sample_t sensor_buffer[3]; // buffer saves last 3 recorded data samples
+enum MovementType { L_R=0, U_D=1 , R_L=2};
+
+struct mpu_sample_t sensor_buffer[BUFFER_SAMPLE_LENGTH]; // buffer saves last 3 recorded data samples
+uint8_t uartBuffer[30]; // Receive buffer
 
 struct melody_t * playing_melody;
+
+char morse;
+char recieved_string[33];
+int recieved_string_len = 0;
 
 static PIN_Handle buttonHandle;
 static PIN_State buttonState;
@@ -81,9 +98,10 @@ static const I2CCC26XX_I2CPinCfg i2cMPUCfg = {
     .pinSCL = Board_I2C0_SCL1
 };
 
-bool checkTilt(int * tilt, struct mpu_sample_t samples[]);
-bool checkJolt(int * jolt, struct mpu_sample_t samples[]);
-char checkMovement(int * movement, struct mpu_sample_t samples[]);
+char translate(char curr_message[]);
+void calculateMean(struct mpu_sample_t sample[], struct mpu_sample_t *mean, int startIndex, int n, int sample_length);
+bool sampleCompare(struct mpu_sample_t *a, struct mpu_sample_t *b);
+bool updateMovement(int iteration[]);
 Void sensorInit(I2C_Handle *i2c, I2C_Params *i2cParams);
 
 
@@ -94,9 +112,12 @@ void buttonFxn(PIN_Handle handle, PIN_Id pinId) {
     if (programState == WAITING) {
         playing_melody = startup;
         programState = READY;
-    } else {
+    } else if (programState == READY) {
         playing_melody = shutdown;
         programState = WAITING;
+    } else if (programState == RECIEVING_WAITING) { // waits and rings until user presses button
+        playing_melody = startup;
+        programState = RECIEVING; // uartTask will start showing the morse code
     }
 }
 
@@ -107,16 +128,39 @@ Void buzzerTaskFxn(UArg arg0, UArg arg1) {
             int i = 0;
 
             while (playing_melody[i].duration > 0) {
-                buzzerSetFrequency(playing_melody[i].frequency);
-                Task_sleep(playing_melody[i].duration * 1000 / Clock_tickPeriod);
+                if (playing_melody[i].frequency > 0) { // if freq is 0 no note is played, can be used as pauses in the melodies
+                    buzzerSetFrequency(playing_melody[i].frequency);
+                    Task_sleep(playing_melody[i].duration * 1000 / Clock_tickPeriod);
+                } else {
+                    buzzerClose();
+                    Task_sleep(playing_melody[i].duration * 1000 / Clock_tickPeriod);
+                    buzzerOpen(hBuzzer);
+                }
                 i++;
             }
 
             buzzerClose();
+            //if (programState != RECIEVING_WAITING) { // repeating "phone call"
             playing_melody = NULL;
+            //}
         }
         Task_sleep(50000 / Clock_tickPeriod);
     }
+}
+
+
+void uartFxn(UART_Handle uart, void *rxBuf, size_t len) {
+    uint8_t recieved_morse = *((uint8_t*)rxBuf);
+
+    //if (recieved_morse == ' ' || recieved_morse == '.' || recieved_morse == '-') {
+        recieved_string[recieved_string_len] = (char)recieved_morse;
+        recieved_string_len++;
+        programState = RECIEVING;
+
+    //}
+    //playing_melody = recieving;
+
+    UART_read(uart, rxBuf, 3);
 }
 
 Void uartTaskFxn(UArg arg0, UArg arg1) {
@@ -127,7 +171,8 @@ Void uartTaskFxn(UArg arg0, UArg arg1) {
     uartParams.writeDataMode = UART_DATA_TEXT;
     uartParams.readDataMode = UART_DATA_TEXT;
     uartParams.readEcho = UART_ECHO_OFF;
-    uartParams.readMode = UART_MODE_BLOCKING;
+    uartParams.readMode = UART_MODE_CALLBACK; // Interrupt-based reception
+    uartParams.readCallback = &uartFxn; // Handler function
     uartParams.baudRate = 9600;
     uartParams.dataLength = UART_LEN_8; // 8
     uartParams.parityType = UART_PAR_NONE; // n
@@ -138,161 +183,187 @@ Void uartTaskFxn(UArg arg0, UArg arg1) {
         System_abort("Error opening the UART");
     }
 
-    int movement[2] = {-1, 0};
-    char curr_message[6];
-    int message_len = 0;
+    char morse_str[4];
+
+    UART_read(uart, uartBuffer, 3);
 
     while (1) {
-        if (programState == WAITING) {
-            Task_sleep(50000/ Clock_tickPeriod);
-            continue;
-        }
 
-        /* FOR DETECTING MOVEMENT */
+        /* FOR SENDING MORSE */
         if (dataState == READY) {
 
-            /*Sanity check
-            char str1[32];
-            if (tilt) {
-                sprintf(str1, "Tilt detected %d\n\r", tilt);
-            } else {
-                sprintf(str1, "Device is idle\n\r");
-            }
-            UART_write(uart, str1, strlen(str1) + 1);
-            */
-
-            char morse = checkMovement(movement, sensor_buffer);
-
             if (morse != '\0') {
-                char str[4] = {morse, '\n', '\r', '\0'};
-                UART_write(uart, str, 4);
-                switch(morse){
-                case('.'):
+
+                sprintf(morse_str, "%c\r\n", morse);
+
+                UART_write(uart, morse_str, 4);
+
+            }
+            morse = '\0';
+            dataState = WAITING;
+
+            /* FOR COLLECTING DATA
+            char str1[64];
+            sprintf(str1, "%f,%3.2f,%3.2f,%3.2f,%3.2f,%3.2f,%3.2f\r\n", sensor_buffer[2].timestamp, sensor_buffer[2].accel.ax, sensor_buffer[2].accel.ay, sensor_buffer[2].accel.az, sensor_buffer[2].gyro.gx, sensor_buffer[2].gyro.gy, sensor_buffer[2].gyro.gz);
+            UART_write(uart, str1, strlen(str1) + 1); */
+
+        }
+
+        if (programState == RECIEVING) {
+            int i;
+            uint_t pinValue = PIN_getOutputValue(Board_LED0);
+            recieved_string[recieved_string_len] = '\0';
+            UART_write(uart, recieved_string, strlen(recieved_string) + 1);
+            for (i = 0; i < recieved_string_len; i++) {
+                switch(recieved_string[i]) {
+                    case(' '):
+                        Task_sleep(1000000/ Clock_tickPeriod); // 1,5 sec silence between every letter
+                        break;
+                    case ('.'):
+                        PIN_setOutputValue(ledHandle, Board_LED0, !pinValue);
+                        Task_sleep(100000/ Clock_tickPeriod);
+                        PIN_setOutputValue(ledHandle, Board_LED0, pinValue);
+                        //playing_melody = dot;
+                        break;
+                    case('-'):
+                        PIN_setOutputValue(ledHandle, Board_LED0, !pinValue);
+                        Task_sleep(500000/ Clock_tickPeriod);
+                        PIN_setOutputValue(ledHandle, Board_LED0, pinValue);
+                        //playing_melody = dash;
+                        break;
+                    default:
+                        PIN_setOutputValue(ledHandle, Board_LED0, !pinValue);
+                        Task_sleep(1000000/ Clock_tickPeriod); // 1,5 sec silence between every letter
+                        PIN_setOutputValue(ledHandle, Board_LED0, pinValue);
+                        break;
+                }
+                Task_sleep(500000/ Clock_tickPeriod);
+            }
+
+            recieved_string_len = 0;
+            programState = READY;
+/*
+            switch(recieved_string[0]) {
+                case(' '):
+                    Task_sleep(1000000/ Clock_tickPeriod); // 2 sec silence between every letter
+                    break;
+                case ('.'):
                     playing_melody = dot;
                     break;
                 case('-'):
                     playing_melody = dash;
                     break;
-                }
-
-                if (morse == ' ') { // translating morse to latin
-                    int i;
-                    if (strlen(curr_message) == 5) {
-                        for (i = 0; i < 10; i++) {
-                            if (strcmp(num_translate[i].morse, curr_message) == 0) {
-                                char str[4] = {num_translate[i].number, '\n', '\r', '\0'};
-                                UART_write(uart, str, 4);
-                                break;
-                            }
-                        }
-                    } else {
-                        for (i = 0; i < 26; i++) {
-                            if (strcmp(translate[i].morse, curr_message) == 0) {
-                                char str[4] = {translate[i].latin, '\n', '\r', '\0'};
-                                UART_write(uart, str, 4);
-                                break;
-                            }
-                        }
-                    }
-                    curr_message[0] = '\0';
-                    message_len = 0;
-                } else if (message_len < 5) {
-                    curr_message[message_len + 1] = curr_message[message_len];
-                    curr_message[message_len] = morse;
-                    message_len++;
-                } else {
-                    curr_message[0] = '\0';
-                    message_len = 0;
-                }
+                case('\0'):
+                    programState = READY;
+                    recieved_string[0] = '\0';
+                    i = -1; // is incremented back to 0
+                    break;
             }
-
-
-            dataState = WAITING;
+            i++;
+            Task_sleep(1000000/ Clock_tickPeriod); // 1 sec between every morse*/
         }
-        /* FOR COLLECTING DATA
-        char str1[64];
-        if (dataState == READY) {
-            sprintf(str1, "%f,%3.2f,%3.2f,%3.2f,%3.2f,%3.2f,%3.2f\n\r", sensor_buffer[2].timestamp, sensor_buffer[2].accel.ax, sensor_buffer[2].accel.ay, sensor_buffer[2].accel.az, sensor_buffer[2].gyro.gx, sensor_buffer[2].gyro.gy, sensor_buffer[2].gyro.gz);
-            UART_write(uart, str1, strlen(str1) + 1);
-            dataState = WAITING;
-        }*/
 
         // Once per 50ms
         Task_sleep(50000/ Clock_tickPeriod);
     }
 }
 
-bool checkTilt(int * tilt, struct mpu_sample_t samples[]) {
-    float diff_gy = tilt_data[0].gyro.gy - samples[2].gyro.gy;
-    int threshold = 170;
-    if (*tilt == 0) {
-        if (diff_gy > threshold + 50) {
-            (*tilt)++;
-        } else {
-            *tilt = 0;
-        }
-    } else if (*tilt < 4) {
-        if (diff_gy < -threshold) {
-            return true;
-        } else {
-            (*tilt)++;
+char translate(char curr_message[]) {
+    int i;
+    for (i = 0; i < 36; i++) {
+        if (strcmp(translation[i].morse, curr_message) == 0) {
+            return translation[i].latin;
         }
     }
-    return false;
+    return '\0'; // no translation found
 }
 
-bool checkJolt(int * jolt, struct mpu_sample_t samples[]) {
-    float diff_ay = tilt_data[0].accel.ay - samples[2].accel.ay;
-    float threshold = 0.6;
-    if (*jolt == 0) {
-        if (diff_ay > threshold + 0.2) {
-            (*jolt)++;
-        } else {
-            *jolt = 0;
-        }
-    } else if (*jolt < 4) {
-        if (diff_ay < -threshold) {
-            return true;
-        } else {
-            (*jolt)++;
-        }
-    }
-    return false;
+bool sampleCompare(struct mpu_sample_t *a, struct mpu_sample_t *b) {
+    return (fabsf(a->accel.ax - b->accel.ax) < ACCEL_THRESHOLD) &&
+           (fabsf(a->accel.ay - b->accel.ay) < ACCEL_THRESHOLD) &&
+           // (fabsf(a->accel.az - b->accel.az) < ACCEL_THRESHOLD) && // z-axis doesn't seem to work correctly
+           (fabsf(a->gyro.gx - b->gyro.gx) < GYRO_THRESHOLD) &&
+           (fabsf(a->gyro.gy - b->gyro.gy) < GYRO_THRESHOLD) &&
+           (fabsf(a->gyro.gz - b->gyro.gz) < GYRO_THRESHOLD);
 }
 
-char checkMovement(int * movement, struct mpu_sample_t samples[]) {
-    char result = '\0';
-    if (movement[0] == -1 || movement[0] == 0) {
-        // dot
-        if (checkTilt(&movement[1], samples)) {
-            result = '.';
-            movement[0] = -1;
-            movement[1] = 0;
-        } else if (movement[1] > 0 && movement[1] < 4) {
-            movement[0] = 0;
-        } else {
-            movement[0] = -1;
-            movement[1] = 0;
-        }
+void calculateMean(struct mpu_sample_t sample[], struct mpu_sample_t *mean, int startIndex, int n, int sample_length) {
+    /* Helper function to calculate mean (or moving average) of buffer/data */
+    // check if startIndex and n are valid
+    if (startIndex < 0 || n <= 0 || startIndex + n > sample_length) {
+        return;
     }
-    if (movement[0] == -1 || movement[0] == 1) {
-        // dash
-        if (checkJolt(&movement[1], samples)) {
-            result = ' ';
-            movement[0] = -1;
-            movement[1] = 0;
-        } else if (movement[1] > 0 && movement[1] < 4) {
-            movement[0] = 1;
-        } else {
-            movement[0] = -1;
-            movement[1] = 0;
-        }
+    // ensure mean is empty
+    mean->accel.ax = mean->accel.ay = mean->accel.az = 0;
+    mean->gyro.gx = mean->gyro.gy = mean->gyro.gz = 0;
+
+    int i;
+    for (i = startIndex; i < startIndex + n; i++) {
+        mean->accel.ax += sample[i].accel.ax / n;
+        mean->accel.ay += sample[i].accel.ay / n;
+        mean->accel.az += sample[i].accel.az / n;
+        mean->gyro.gx += sample[i].gyro.gx / n;
+        mean->gyro.gy += sample[i].gyro.gy / n;
+        mean->gyro.gz += sample[i].gyro.gz / n;
     }
-    if (movement[0] == -1 || movement[0] == 2) {
-        // space
+}
+
+bool updateMovement(int iteration[]) {
+    /* Always calculates mean of the 3 last samples in sensor_buffer
+     * Calculates rolling mean of recorded data with iteration going from 0 to N-3
+     * compares calculated means with defined thresholds
+     * Iteration stays at 0 until match is found
+     * When a match is found, iteration moves up
+     * If matching streak breaks, iteration goes back to 0
+     * */
+    struct mpu_sample_t buffer_mean = {0, {0, 0, 0}, {0, 0, 0}};
+    struct mpu_sample_t data_mean = {0, {0, 0, 0}, {0, 0, 0}};
+    bool skip[NUMBER_OF_MOVEMENTS] = {false};
+    bool movement_detected = false;
+
+    // calculate mean of buffer
+    calculateMean(sensor_buffer, &buffer_mean, 0, BLOCK_SIZE, BUFFER_SAMPLE_LENGTH);
+
+    // check from which data to calculate the rolling mean
+    if (iteration[L_R] == 0 && iteration[U_D] == 0 && iteration[R_L] == 0) { // no movements detected yet
+        //calculate all, for loop doesn't skip anything
+        skip[L_R] = skip[U_D] = skip[R_L] = false;
+
+    } else { // at least one movement has been "detected"
+        // figure out which movements need to be skipped and which ones need to be checked
+        if (iteration[L_R] == 0) {
+            // no tilt, for loop skips tilting check
+            skip[L_R] = true;
+        }
+        if (iteration[U_D] == 0) {
+            // no jolt, for loop skips jolting check
+            skip[U_D] = true;
+        }
+        if (iteration[R_L] == 0) {
+
+            skip[R_L] = true;
+        }
 
     }
-    return result;
+    int i;
+    for (i = 0; i < NUMBER_OF_MOVEMENTS; i++) {
+        if (skip[i]) { // check if movement check needs to be skipped
+            continue;
+        }
+        // calculate an iteration of rolling mean of data
+        calculateMean((*reference_data)[i], &data_mean, iteration[i], BLOCK_SIZE, REFERENCE_SAMPLE_LENGTH);
+
+        //compare data and buffer
+        if (sampleCompare(&buffer_mean, &data_mean)) {
+            iteration[i]++;
+            movement_detected = true;
+        } else {
+            iteration[i] = 0;
+        }
+    }
+    //morse = (char)(iteration[L_R] + 48); //for debugging
+
+    return movement_detected;
 }
 
 Void sensorInit(I2C_Handle *i2c, I2C_Params *i2cParams) {
@@ -331,8 +402,11 @@ Void sensorTaskFxn(UArg arg0, UArg arg1) {
     I2C_Params i2cMPUParams;
 
     sensorInit(&i2cMPU, &i2cMPUParams);
+
+    int iteration[NUMBER_OF_MOVEMENTS] = {0}; // [tilt, jolt]
+
     while (1) {
-        if (programState == WAITING) {
+        if (programState != READY) {
             Task_sleep(50000/ Clock_tickPeriod);
             continue;
         }
@@ -344,7 +418,37 @@ Void sensorTaskFxn(UArg arg0, UArg arg1) {
             mpu9250_get_data(&i2cMPU, &(sensor_buffer[2].accel.ax), &(sensor_buffer[2].accel.ay), &(sensor_buffer[2].accel.az), &(sensor_buffer[2].gyro.gx), &(sensor_buffer[2].gyro.gy), &(sensor_buffer[2].gyro.gz));
             uint32_t ticks = Clock_getTicks();
             sensor_buffer[2].timestamp = (float) ticks * (Clock_tickPeriod / 1000000.0);
-            dataState = READY;
+
+            //dataState = READY;      // IF COLLECTING DATA, UNCOMMENT THIS AND THE NEXT LINE
+            //continue;               // FOR DATA COLLECTION
+
+            // check for movement
+            if (updateMovement(iteration)){
+                int i;
+                for (i = 0; i < NUMBER_OF_MOVEMENTS; i++) {
+                    if (iteration[i] >= REFERENCE_SAMPLE_LENGTH - 3) {
+                        switch(i) {
+                            case(L_R):
+                                morse = '.';
+                                playing_melody = dot;
+                                break;
+                            case(U_D):
+                                morse = '-';
+                                playing_melody = dash;
+                                break;
+                            case(R_L):
+                                morse = ' ';
+                                playing_melody = space;
+                                break;
+                        }
+                        // ensure all movements are back to 0
+                        iteration[L_R] = iteration[U_D] = iteration[R_L] = 0;
+                        dataState = READY;
+                        break;
+                    }
+                }
+            }
+            //dataState = READY;
         }
 
         Task_sleep(50000 / Clock_tickPeriod);
@@ -414,7 +518,7 @@ Int main(void) {
     Task_Params_init(&buzzerTaskParams);
     buzzerTaskParams.stackSize = STACKSIZE;
     buzzerTaskParams.stack = &buzzerTaskStack;
-    buzzerTaskParams.priority = 3;
+    buzzerTaskParams.priority = 2;
     buzzerTaskHandle = Task_create((Task_FuncPtr)buzzerTaskFxn, &buzzerTaskParams, NULL);
     if (buzzerTaskHandle == NULL) {
         System_abort("Task create failed!");
