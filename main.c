@@ -2,7 +2,7 @@
  * main.c
  *
  *  Created on: 20 Oct 2024
- *      Author: alexl
+ *      Authors: Alex Laukkanen & Anniina Viskari
  */
 
 #include "library.h"
@@ -34,15 +34,16 @@
 
 
 #define STACKSIZE 2048
+#define TASK_SLEEP 50000 // microseconds
 
+#define MAX_RECIEVED_MORSE_STRING_LEN 100
 #define BUFFER_SAMPLE_LENGTH 3
-#define REFERENCE_SAMPLE_LENGTH 7
+#define REFERENCE_DATA_LENGTH 8
 #define NUMBER_OF_MOVEMENTS 3
+#define BLOCK_SIZE 3
 
-#define BLOCK_SIZE 2
-
-#define ACCEL_THRESHOLD 0.3f
-#define GYRO_THRESHOLD 200
+#define ACCEL_THRESHOLD 0.45f
+#define GYRO_THRESHOLD 150
 
 Char sensorTaskStack[STACKSIZE];
 Char uartTaskStack[STACKSIZE * 2];
@@ -52,7 +53,7 @@ enum state { WAITING=0, READY, RECIEVING_WAITING, RECIEVING };
 enum state programState = WAITING;
 enum state dataState = WAITING;
 
-enum MovementType { L_R=0, U_D=1 , R_L=2};
+enum MovementType { R_L=0, F_B, TWIST };
 
 struct mpu_sample_t sensor_buffer[BUFFER_SAMPLE_LENGTH]; // buffer saves last 3 recorded data samples
 uint8_t uartBuffer[30]; // Receive buffer
@@ -60,8 +61,10 @@ uint8_t uartBuffer[30]; // Receive buffer
 struct melody_t * playing_melody;
 
 char morse;
-char recieved_string[33];
+
+char recieved_string[MAX_RECIEVED_MORSE_STRING_LEN];
 int recieved_string_len = 0;
+float last_morse_time = 0;
 
 static PIN_Handle buttonHandle;
 static PIN_State buttonState;
@@ -99,24 +102,25 @@ static const I2CCC26XX_I2CPinCfg i2cMPUCfg = {
 };
 
 char translate(char curr_message[]);
-void calculateMean(struct mpu_sample_t sample[], struct mpu_sample_t *mean, int startIndex, int n, int sample_length);
+void calculateMean(const struct mpu_sample_t sample[], struct mpu_sample_t *mean, int startIndex, int n, int sample_length);
 bool sampleCompare(struct mpu_sample_t *a, struct mpu_sample_t *b);
 bool updateMovement(int iteration[]);
 Void sensorInit(I2C_Handle *i2c, I2C_Params *i2cParams);
 
 
 void buttonFxn(PIN_Handle handle, PIN_Id pinId) {
-    uint_t pinValue = PIN_getOutputValue(Board_LED0);
-    pinValue = !pinValue;
-    PIN_setOutputValue(ledHandle, Board_LED0, pinValue);
     if (programState == WAITING) {
+        PIN_setOutputValue(ledHandle, Board_LED0, 1);
         playing_melody = startup;
         programState = READY;
+
     } else if (programState == READY) {
+        PIN_setOutputValue(ledHandle, Board_LED0, 0);
         playing_melody = shutdown;
         programState = WAITING;
+
     } else if (programState == RECIEVING_WAITING) { // waits and rings until user presses button
-        playing_melody = startup;
+        playing_melody = NULL;
         programState = RECIEVING; // uartTask will start showing the morse code
     }
 }
@@ -127,40 +131,52 @@ Void buzzerTaskFxn(UArg arg0, UArg arg1) {
             buzzerOpen(hBuzzer);
             int i = 0;
 
-            while (playing_melody[i].duration > 0) {
-                if (playing_melody[i].frequency > 0) { // if freq is 0 no note is played, can be used as pauses in the melodies
-                    buzzerSetFrequency(playing_melody[i].frequency);
-                    Task_sleep(playing_melody[i].duration * 1000 / Clock_tickPeriod);
-                } else {
+            while (playing_melody[i].duration > 0 && playing_melody != NULL) {
+                if (playing_melody[i].frequency == 0) { // if freq is 0 no note is played, can be used as pauses in the melodies
                     buzzerClose();
                     Task_sleep(playing_melody[i].duration * 1000 / Clock_tickPeriod);
                     buzzerOpen(hBuzzer);
+                } else {
+                    buzzerSetFrequency(playing_melody[i].frequency);
+                    Task_sleep(playing_melody[i].duration * 1000 / Clock_tickPeriod);
                 }
                 i++;
             }
 
             buzzerClose();
-            //if (programState != RECIEVING_WAITING) { // repeating "phone call"
-            playing_melody = NULL;
-            //}
+            if (programState != RECIEVING_WAITING) { // repeating "phone call"
+                playing_melody = NULL;
+            }
         }
-        Task_sleep(50000 / Clock_tickPeriod);
+        Task_sleep(TASK_SLEEP / Clock_tickPeriod);
     }
 }
 
 
 void uartFxn(UART_Handle uart, void *rxBuf, size_t len) {
-    uint8_t recieved_morse = *((uint8_t*)rxBuf);
+    uint8_t recieved_morse = *(uint8_t*)rxBuf; //cast and dereference
+    //only valid morse characters and check is the array recieved_string has room
+    if ((recieved_morse == '.' || recieved_morse == '-' || recieved_morse == ' ') && recieved_string_len < MAX_RECIEVED_MORSE_STRING_LEN) {
+        //detecting spaces with timing of the morse code
+        uint32_t ticks = Clock_getTicks();
+        float this_morse_time = (float) ticks * (Clock_tickPeriod / 1000000.0);
+        float time_diff = this_morse_time - last_morse_time;
 
-    //if (recieved_morse == ' ' || recieved_morse == '.' || recieved_morse == '-') {
+        if (time_diff > 1 && time_diff < 2) { // pause in the morse code = space
+            recieved_string[recieved_string_len] = ' ';
+            recieved_string_len++;
+        }
+
         recieved_string[recieved_string_len] = (char)recieved_morse;
         recieved_string_len++;
-        programState = RECIEVING;
+        last_morse_time = this_morse_time;
 
-    //}
-    //playing_melody = recieving;
-
-    UART_read(uart, rxBuf, 3);
+        if (programState != RECIEVING) { // in case user is in the midst of "reading" message at the same time it is still sending it
+            programState = RECIEVING_WAITING;
+            playing_melody = recieving;
+        }
+    }
+    UART_read(uart, rxBuf, 1);
 }
 
 Void uartTaskFxn(UArg arg0, UArg arg1) {
@@ -184,8 +200,21 @@ Void uartTaskFxn(UArg arg0, UArg arg1) {
     }
 
     char morse_str[4];
+    int i = 0;
 
-    UART_read(uart, uartBuffer, 3);
+    /* IF NOT USING SERIAL.CLIENT
+    char curr_message[7];
+    char translated_message[64];
+    // ensure proper initialization
+    curr_message[0] = '\0';
+    translated_message[0] = '\0';
+
+    int curr_message_len = 0;
+    int translated_message_len = 0;
+    int whitespaces = 0;
+    IF NOT USING THE SERIAL.CLIENT ENDS */
+
+    UART_read(uart, uartBuffer, 1);
 
     while (1) {
 
@@ -193,12 +222,65 @@ Void uartTaskFxn(UArg arg0, UArg arg1) {
         if (dataState == READY) {
 
             if (morse != '\0') {
-
                 sprintf(morse_str, "%c\r\n", morse);
-
                 UART_write(uart, morse_str, 4);
 
+
+                /* IF NOT USING THE SERIAL.CLIENT
+                if (morse == ' ') { // if a word is completed, translate morse to latin
+                    // track number of whitespaces in a row
+                    whitespaces++;
+
+                    // check how many whitespaces have been sent in a row
+                    if (whitespaces == 1) { // translate single character from curr_message into translated_message
+                        char translation = translate(curr_message);
+                        if (translation != '\0'){
+                            translated_message[translated_message_len + 1] = '\0';
+                            translated_message[translated_message_len] = translation;
+                            translated_message_len++;
+                        } else { // if there is no translation, reset and send info to user
+                            char str[37];
+                            sprintf(str, "RESET: UNIDENTIFIED MORSE (%s)\r\n", curr_message);
+                            UART_write(uart, str, strlen(str) + 1);
+                            Task_sleep(300000/ Clock_tickPeriod); // 300ms to avoid overlapping buzzer
+                            playing_melody = error;
+                        }
+                        // reset curr_message
+                        curr_message[0] = '\0';
+                        curr_message_len = 0;
+
+                    } else if (whitespaces == 2) { // add a whitespace to translated_message
+                        translated_message[translated_message_len + 1] = '\0'; // move null terminator
+                        translated_message[translated_message_len] = ' ';
+                        translated_message_len++;
+
+                    } else if (whitespaces == 3) { // show the translated message
+                        translated_message[translated_message_len] = '\r'; // add newline and move null terminator
+                        translated_message[translated_message_len + 1] = '\n';
+                        translated_message[translated_message_len + 2] = '\0';
+                        UART_write(uart, translated_message, strlen(translated_message) + 1);
+                        // reset translated_message
+                        translated_message[0] = '\0';
+                        translated_message_len = 0;
+                    }
+                } else if (curr_message_len < 5) { // add morse char to current recorded line of morse code
+                    curr_message[curr_message_len + 1] = '\0'; // move null terminator
+                    curr_message[curr_message_len] = morse;
+                    curr_message_len++;
+                    whitespaces = 0;
+                } else { // if morse code is too long to be any Latin character or number, reset current recorded line of morse code
+                    char str[32];
+                    sprintf(str, "RESET: MORSE TOO LONG (%s)\n\r", curr_message);
+                    UART_write(uart, str, strlen(str) + 1);
+                    Task_sleep(300000/ Clock_tickPeriod); // 300ms to avoid overlapping buzzer
+                    playing_melody = error;
+                    curr_message[0] = '\0';
+                    curr_message_len = 0;
+                    whitespaces = 0;
+                }
+                IF NOT USING THE SERIAL.CLIENT ENDS */
             }
+
             morse = '\0';
             dataState = WAITING;
 
@@ -208,63 +290,57 @@ Void uartTaskFxn(UArg arg0, UArg arg1) {
             UART_write(uart, str1, strlen(str1) + 1); */
 
         }
-
-        if (programState == RECIEVING) {
-            int i;
-            uint_t pinValue = PIN_getOutputValue(Board_LED0);
-            recieved_string[recieved_string_len] = '\0';
-            UART_write(uart, recieved_string, strlen(recieved_string) + 1);
-            for (i = 0; i < recieved_string_len; i++) {
-                switch(recieved_string[i]) {
-                    case(' '):
-                        Task_sleep(1000000/ Clock_tickPeriod); // 1,5 sec silence between every letter
-                        break;
-                    case ('.'):
-                        PIN_setOutputValue(ledHandle, Board_LED0, !pinValue);
-                        Task_sleep(100000/ Clock_tickPeriod);
-                        PIN_setOutputValue(ledHandle, Board_LED0, pinValue);
-                        //playing_melody = dot;
-                        break;
-                    case('-'):
-                        PIN_setOutputValue(ledHandle, Board_LED0, !pinValue);
-                        Task_sleep(500000/ Clock_tickPeriod);
-                        PIN_setOutputValue(ledHandle, Board_LED0, pinValue);
-                        //playing_melody = dash;
-                        break;
-                    default:
-                        PIN_setOutputValue(ledHandle, Board_LED0, !pinValue);
-                        Task_sleep(1000000/ Clock_tickPeriod); // 1,5 sec silence between every letter
-                        PIN_setOutputValue(ledHandle, Board_LED0, pinValue);
-                        break;
-                }
-                Task_sleep(500000/ Clock_tickPeriod);
+        /* IF NOT USING THE SERIAL.CLIENT
+        if (programState == WAITING) {
+            //pressing the button resets the morse character being written
+            if (curr_message_len > 0) {
+                char str[26];
+                sprintf(str, "MANUAL RESET (%s)\r\n", curr_message);
+                UART_write(uart, str, strlen(str) + 1);
+                curr_message[0] = '\0';
+                curr_message_len = 0;
             }
+            morse = '\0';
+        }
+        IF NOT USING THE SERIAL.CLIENT ENDS */
 
-            recieved_string_len = 0;
-            programState = READY;
-/*
-            switch(recieved_string[0]) {
+        // When recieving morse code
+        if (programState == RECIEVING) {
+            Task_sleep(1000000/ Clock_tickPeriod);
+
+            // printing for debugging
+            // sprintf(morse_str, "%c\r\n", recieved_string[i]);
+            // UART_write(uart, morse_str, 4);
+
+            switch(recieved_string[i]) {
                 case(' '):
-                    Task_sleep(1000000/ Clock_tickPeriod); // 2 sec silence between every letter
+                    Task_sleep(1000000/ Clock_tickPeriod); // space is just an extra pause
                     break;
-                case ('.'):
+                case('.'):
                     playing_melody = dot;
                     break;
                 case('-'):
                     playing_melody = dash;
                     break;
-                case('\0'):
-                    programState = READY;
-                    recieved_string[0] = '\0';
-                    i = -1; // is incremented back to 0
+                default:  // in case there has slipped some other character, shouldn't be possible
+                    playing_melody = error;
                     break;
             }
+
             i++;
-            Task_sleep(1000000/ Clock_tickPeriod); // 1 sec between every morse*/
+            if (i == recieved_string_len) {
+                Task_sleep(1000000/ Clock_tickPeriod); // wait for the last morse to be heard
+                playing_melody = space; // space sound to indicate end of message
+                // reset everything and set programState to WAITING
+                recieved_string_len = 0;
+                i = 0;
+                PIN_setOutputValue(ledHandle, Board_LED0, 0);
+                programState = WAITING;
+            }
         }
 
-        // Once per 50ms
-        Task_sleep(50000/ Clock_tickPeriod);
+        // Once per 75ms
+        Task_sleep(TASK_SLEEP / Clock_tickPeriod);
     }
 }
 
@@ -287,7 +363,7 @@ bool sampleCompare(struct mpu_sample_t *a, struct mpu_sample_t *b) {
            (fabsf(a->gyro.gz - b->gyro.gz) < GYRO_THRESHOLD);
 }
 
-void calculateMean(struct mpu_sample_t sample[], struct mpu_sample_t *mean, int startIndex, int n, int sample_length) {
+void calculateMean(const struct mpu_sample_t sample[], struct mpu_sample_t *mean, int startIndex, int n, int sample_length) {
     /* Helper function to calculate mean (or moving average) of buffer/data */
     // check if startIndex and n are valid
     if (startIndex < 0 || n <= 0 || startIndex + n > sample_length) {
@@ -309,7 +385,7 @@ void calculateMean(struct mpu_sample_t sample[], struct mpu_sample_t *mean, int 
 }
 
 bool updateMovement(int iteration[]) {
-    /* Always calculates mean of the 3 last samples in sensor_buffer
+    /* Always calculates mean of the last 3 samples in sensor_buffer
      * Calculates rolling mean of recorded data with iteration going from 0 to N-3
      * compares calculated means with defined thresholds
      * Iteration stays at 0 until match is found
@@ -325,23 +401,20 @@ bool updateMovement(int iteration[]) {
     calculateMean(sensor_buffer, &buffer_mean, 0, BLOCK_SIZE, BUFFER_SAMPLE_LENGTH);
 
     // check from which data to calculate the rolling mean
-    if (iteration[L_R] == 0 && iteration[U_D] == 0 && iteration[R_L] == 0) { // no movements detected yet
+    if (iteration[R_L] == 0 && iteration[F_B] == 0 && iteration[TWIST] == 0) { // no movements detected yet
         //calculate all, for loop doesn't skip anything
-        skip[L_R] = skip[U_D] = skip[R_L] = false;
+        skip[R_L] = skip[F_B] = skip[TWIST] = false;
 
     } else { // at least one movement has been "detected"
         // figure out which movements need to be skipped and which ones need to be checked
-        if (iteration[L_R] == 0) {
-            // no tilt, for loop skips tilting check
-            skip[L_R] = true;
-        }
-        if (iteration[U_D] == 0) {
-            // no jolt, for loop skips jolting check
-            skip[U_D] = true;
-        }
         if (iteration[R_L] == 0) {
-
             skip[R_L] = true;
+        }
+        if (iteration[F_B] == 0) {
+            skip[F_B] = true;
+        }
+        if (iteration[TWIST] == 0) {
+            skip[TWIST] = true;
         }
 
     }
@@ -351,7 +424,7 @@ bool updateMovement(int iteration[]) {
             continue;
         }
         // calculate an iteration of rolling mean of data
-        calculateMean((*reference_data)[i], &data_mean, iteration[i], BLOCK_SIZE, REFERENCE_SAMPLE_LENGTH);
+        calculateMean((*reference_data)[i], &data_mean, iteration[i], BLOCK_SIZE, REFERENCE_DATA_LENGTH);
 
         //compare data and buffer
         if (sampleCompare(&buffer_mean, &data_mean)) {
@@ -361,7 +434,6 @@ bool updateMovement(int iteration[]) {
             iteration[i] = 0;
         }
     }
-    //morse = (char)(iteration[L_R] + 48); //for debugging
 
     return movement_detected;
 }
@@ -403,11 +475,11 @@ Void sensorTaskFxn(UArg arg0, UArg arg1) {
 
     sensorInit(&i2cMPU, &i2cMPUParams);
 
-    int iteration[NUMBER_OF_MOVEMENTS] = {0}; // [tilt, jolt]
+    int iteration[NUMBER_OF_MOVEMENTS] = {0}; // {R_L, F_B, TWIST}
 
     while (1) {
         if (programState != READY) {
-            Task_sleep(50000/ Clock_tickPeriod);
+            Task_sleep(TASK_SLEEP / Clock_tickPeriod);
             continue;
         }
         if (dataState == WAITING) {
@@ -426,32 +498,32 @@ Void sensorTaskFxn(UArg arg0, UArg arg1) {
             if (updateMovement(iteration)){
                 int i;
                 for (i = 0; i < NUMBER_OF_MOVEMENTS; i++) {
-                    if (iteration[i] >= REFERENCE_SAMPLE_LENGTH - 3) {
+                    if (iteration[i] > REFERENCE_DATA_LENGTH - BLOCK_SIZE) {
                         switch(i) {
-                            case(L_R):
+                            case(R_L):
                                 morse = '.';
                                 playing_melody = dot;
                                 break;
-                            case(U_D):
+                            case(F_B):
                                 morse = '-';
                                 playing_melody = dash;
                                 break;
-                            case(R_L):
+                            case(TWIST):
                                 morse = ' ';
                                 playing_melody = space;
                                 break;
                         }
                         // ensure all movements are back to 0
-                        iteration[L_R] = iteration[U_D] = iteration[R_L] = 0;
+                        iteration[R_L] = iteration[F_B] = iteration[TWIST] = 0;
                         dataState = READY;
                         break;
                     }
                 }
             }
-            //dataState = READY;
         }
 
-        Task_sleep(50000 / Clock_tickPeriod);
+        // Once per 75ms
+        Task_sleep(TASK_SLEEP / Clock_tickPeriod);
     }
 }
 
